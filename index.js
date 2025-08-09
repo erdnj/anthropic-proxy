@@ -196,7 +196,7 @@ fastify.post('/v1/messages', async (request, reply) => {
       }))
 
     const openaiPayload = {
-      model: payload.thinking ? models.reasoning : (payload.model || models.completion),
+      model: payload.thinking ? models.reasoning : models.completion,
       messages,
       max_tokens: payload.max_tokens,
       temperature: payload.temperature !== undefined ? payload.temperature : 1,
