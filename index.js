@@ -2,18 +2,13 @@
 import Fastify from 'fastify'
 import { TextDecoder } from 'util'
 
-// Base URL: point this at vLLM or any OpenAI-compatible backend.
-// e.g. export ANTHROPIC_PROXY_BASE_URL="http://192.168.1.111:8001"
 const baseUrl = process.env.ANTHROPIC_PROXY_BASE_URL || 'https://openrouter.ai/api'
 const requiresApiKey = !process.env.ANTHROPIC_PROXY_BASE_URL
 const key = requiresApiKey ? process.env.OPENROUTER_API_KEY : null
-
-// Default upstream model when using OpenRouter fallback.
-// Ignored when ANTHROPIC_PROXY_BASE_URL points at vLLM.
-const model = 'google/gemini-2.0-pro-exp-02-05:free'
+const defaultModel = 'google/gemini-2.0-pro-exp-02-05:free'
 const models = {
-  reasoning: process.env.REASONING_MODEL || model,
-  completion: process.env.COMPLETION_MODEL || model,
+  reasoning: process.env.REASONING_MODEL || defaultModel,
+  completion: process.env.COMPLETION_MODEL || defaultModel,
 }
 
 const fastify = Fastify({ logger: true })
@@ -23,23 +18,20 @@ function debug(...args) {
   console.log(...args)
 }
 
-// Helper to send SSE quickly
 const sendSSE = (reply, event, data) => {
-  const sseMessage = `event: ${event}\n` + `data: ${JSON.stringify(data)}\n\n`
-  reply.raw.write(sseMessage)
+  reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
   if (typeof reply.raw.flush === 'function') reply.raw.flush()
 }
 
-function mapStopReason(finishReason) {
-  switch (finishReason) {
+function mapStopReason(fr) {
+  switch (fr) {
     case 'tool_calls': return 'tool_use'
-    case 'stop': return 'end_turn'
     case 'length': return 'max_tokens'
+    case 'stop':
     default: return 'end_turn'
   }
 }
 
-// Normalize only text blocks from Anthropic content arrays
 function extractTextFromBlocks(content) {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
@@ -51,16 +43,11 @@ function extractTextFromBlocks(content) {
   return null
 }
 
-// Convert Anthropic tool_result.content → string
 function stringifyToolResultContent(block) {
-  // Anthropic tool_result content can be:
-  // - string: "..."
-  // - object block { type: "json", json: {...} }
-  // - arbitrary object
   if (typeof block === 'string') return block
   if (block && typeof block === 'object') {
     if (block.type === 'json' && block.json !== undefined) {
-      try { return JSON.stringify(block.json) } catch { /* fallthrough */ }
+      try { return JSON.stringify(block.json) } catch { /* noop */ }
     }
     try { return JSON.stringify(block) } catch { return String(block) }
   }
@@ -71,14 +58,13 @@ fastify.post('/v1/messages', async (request, reply) => {
   try {
     const payload = request.body || {}
 
-    // We keep a mapping so we can include function `name` on tool replies.
-    // key: tool_use_id (OpenAI tool_call id), value: function name
+    // Remember tool function names by id so we can set `name` on tool results
     const toolNameById = new Map()
 
-    // Build OpenAI ChatCompletions-style messages array
+    // Build OpenAI Chat Completions messages
     const messages = []
 
-    // Anthropic "system" can be string or array of system blocks; support both.
+    // Anthropic `system` can be string or array
     if (payload.system) {
       if (Array.isArray(payload.system)) {
         payload.system.forEach(sysMsg => {
@@ -96,59 +82,46 @@ fastify.post('/v1/messages', async (request, reply) => {
     if (Array.isArray(payload.messages)) {
       payload.messages.forEach(msg => {
         const role = msg.role // 'user' | 'assistant'
-        const textContent = extractTextFromBlocks(msg.content)
-
-        // Gather tool_use blocks (Anthropic assistant content)
         const contentArray = Array.isArray(msg.content) ? msg.content : []
+        const textContent = extractTextFromBlocks(msg.content)
         const toolUses = contentArray.filter(b => b && b.type === 'tool_use')
         const toolResults = contentArray.filter(b => b && b.type === 'tool_result')
 
-        // If there are tool_use blocks, we must emit an OpenAI assistant message
-        // with `tool_calls` and (optionally) text content.
         if (toolUses.length > 0) {
-          const tool_calls = toolUses.map((tu) => {
+          // Build OpenAI assistant tool_calls; IMPORTANT: content must be null
+          const tool_calls = toolUses.map(tu => {
             const id = String(tu.id || '').trim()
             const name = String(tu.name || '').trim()
-            const inputObj = tu.input ?? {}
-
-            // Remember mapping for later tool_result → OpenAI tool message
+            const input = tu.input ?? {}
             if (id && name) toolNameById.set(id, name)
-
             return {
-              id,                                // MUST be 9-char alnum if coming from vLLM; keep as-is
+              id,
               type: 'function',
               function: {
                 name,
-                // MUST be a JSON STRING, not object
-                arguments: JSON.stringify(inputObj)
+                arguments: JSON.stringify(input) // MUST be a string
               }
             }
           })
 
-          const assistantMsg = {
+          messages.push({
             role: 'assistant',
-            content: textContent || '', // OpenAI requires string (can be '')
+            content: textContent ? textContent : null, // <- critical for Mistral
             tool_calls
-          }
-          messages.push(assistantMsg)
+          })
         } else if (role === 'assistant' || role === 'user') {
-          // Regular assistant/user message (no tool_use blocks)
-          const newMsg = { role, content: textContent || '' }
-          if (newMsg.content) messages.push(newMsg)
+          // Normal assistant/user message (no tool_calls)
+          if (textContent && textContent.length) {
+            messages.push({ role, content: textContent })
+          }
         }
 
         // Emit OpenAI tool messages for each tool_result block
-        // We must include tool_call_id and (ideally) the function name.
         toolResults.forEach(tr => {
           const tool_call_id = String(tr.tool_use_id || '').trim()
           const name = toolNameById.get(tool_call_id) || tr.name || 'tool'
           const content = stringifyToolResultContent(tr.content ?? tr.text)
-          messages.push({
-            role: 'tool',
-            tool_call_id,
-            name,
-            content
-          })
+          messages.push({ role: 'tool', tool_call_id, name, content })
         })
       })
     }
@@ -156,21 +129,16 @@ fastify.post('/v1/messages', async (request, reply) => {
     // Tools → OpenAI function tools
     const removeUriFormat = (schema) => {
       if (!schema || typeof schema !== 'object') return schema
-
       if (schema.type === 'string' && schema.format === 'uri') {
         const { format, ...rest } = schema
         return rest
       }
-
       if (Array.isArray(schema)) return schema.map(removeUriFormat)
-
       const result = {}
       for (const k in schema) {
         if (k === 'properties' && typeof schema[k] === 'object') {
           result[k] = {}
-          for (const pk in schema[k]) {
-            result[k][pk] = removeUriFormat(schema[k][pk])
-          }
+          for (const pk in schema[k]) result[k][pk] = removeUriFormat(schema[k][pk])
         } else if (k === 'items' && typeof schema[k] === 'object') {
           result[k] = removeUriFormat(schema[k])
         } else if (k === 'additionalProperties' && typeof schema[k] === 'object') {
@@ -185,14 +153,14 @@ fastify.post('/v1/messages', async (request, reply) => {
     }
 
     const tools = (payload.tools || [])
-      .filter(tool => !['BatchTool'].includes(tool.name))
-      .map(tool => ({
+      .filter(t => !['BatchTool'].includes(t.name))
+      .map(t => ({
         type: 'function',
         function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: removeUriFormat(tool.input_schema),
-        }
+          name: t.name,
+          description: t.description,
+          parameters: removeUriFormat(t.input_schema),
+        },
       }))
 
     const openaiPayload = {
@@ -231,7 +199,6 @@ fastify.post('/v1/messages', async (request, reply) => {
       const openaiMessage = choice.message || {}
       const stopReason = mapStopReason(choice.finish_reason)
       const toolCalls = openaiMessage.tool_calls || []
-
       const messageId = data.id
         ? data.id.replace('chatcmpl', 'msg')
         : 'msg_' + Math.random().toString(36).slice(2, 26)
@@ -245,10 +212,7 @@ fastify.post('/v1/messages', async (request, reply) => {
             type: 'tool_use',
             id: tc.id,
             name: tc.function?.name,
-            input: (() => {
-              try { return JSON.parse(tc.function?.arguments || '{}') }
-              catch { return {} }
-            })()
+            input: (() => { try { return JSON.parse(tc.function?.arguments || '{}') } catch { return {} } })()
           }))
         ],
         id: messageId,
@@ -266,7 +230,7 @@ fastify.post('/v1/messages', async (request, reply) => {
       return anthropicResponse
     }
 
-    // Streaming path (OpenAI → Anthropic SSE)
+    // Streaming path
     let isSucceeded = false
     function sendSuccessMessage() {
       if (isSucceeded) return
@@ -280,13 +244,9 @@ fastify.post('/v1/messages', async (request, reply) => {
       sendSSE(reply, 'message_start', {
         type: 'message_start',
         message: {
-          id: messageId,
-          type: 'message',
-          role: 'assistant',
-          model: openaiPayload.model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
+          id: messageId, type: 'message', role: 'assistant',
+          model: openaiPayload.model, content: [],
+          stop_reason: null, stop_sequence: null,
           usage: { input_tokens: 0, output_tokens: 0 }
         }
       })
@@ -298,7 +258,7 @@ fastify.post('/v1/messages', async (request, reply) => {
     let usage = null
     let textBlockStarted = false
     let encounteredToolCall = false
-    const toolCallAccumulators = {}  // index -> accumulated arguments
+    const toolCallAccumulators = {} // index -> args string so far
     const decoder = new TextDecoder('utf-8')
     const reader = openaiResponse.body.getReader()
     let done = false
@@ -319,27 +279,17 @@ fastify.post('/v1/messages', async (request, reply) => {
         if (dataStr === '[DONE]') {
           if (encounteredToolCall) {
             for (const idx in toolCallAccumulators) {
-              sendSSE(reply, 'content_block_stop', {
-                type: 'content_block_stop',
-                index: parseInt(idx, 10)
-              })
+              sendSSE(reply, 'content_block_stop', { type: 'content_block_stop', index: parseInt(idx, 10) })
             }
           } else if (textBlockStarted) {
-            sendSSE(reply, 'content_block_stop', {
-              type: 'content_block_stop',
-              index: 0
-            })
+            sendSSE(reply, 'content_block_stop', { type: 'content_block_stop', index: 0 })
           }
           sendSSE(reply, 'message_delta', {
             type: 'message_delta',
-            delta: {
-              stop_reason: encounteredToolCall ? 'tool_use' : 'end_turn',
-              stop_sequence: null
-            },
-            usage: usage
-              ? { output_tokens: usage.completion_tokens }
-              : { output_tokens: (accumulatedContent.split(/\s+/).filter(Boolean).length +
-                                  accumulatedReasoning.split(/\s+/).filter(Boolean).length) }
+            delta: { stop_reason: encounteredToolCall ? 'tool_use' : 'end_turn', stop_sequence: null },
+            usage: usage ? { output_tokens: usage.completion_tokens }
+                         : { output_tokens: (accumulatedContent.split(/\s+/).filter(Boolean).length +
+                                             accumulatedReasoning.split(/\s+/).filter(Boolean).length) }
           })
           sendSSE(reply, 'message_stop', { type: 'message_stop' })
           reply.raw.end()
@@ -362,12 +312,7 @@ fastify.post('/v1/messages', async (request, reply) => {
               sendSSE(reply, 'content_block_start', {
                 type: 'content_block_start',
                 index: idx,
-                content_block: {
-                  type: 'tool_use',
-                  id: tc.id,
-                  name: tc.function?.name,
-                  input: {}
-                }
+                content_block: { type: 'tool_use', id: tc.id, name: tc.function?.name, input: {} }
               })
             }
             const newArgs = tc.function?.arguments || ''
@@ -385,33 +330,17 @@ fastify.post('/v1/messages', async (request, reply) => {
         } else if (typeof delta.content === 'string' && delta.content.length) {
           if (!textBlockStarted) {
             textBlockStarted = true
-            sendSSE(reply, 'content_block_start', {
-              type: 'content_block_start',
-              index: 0,
-              content_block: { type: 'text', text: '' }
-            })
+            sendSSE(reply, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
           }
           accumulatedContent += delta.content
-          sendSSE(reply, 'content_block_delta', {
-            type: 'content_block_delta',
-            index: 0,
-            delta: { type: 'text_delta', text: delta.content }
-          })
+          sendSSE(reply, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta.content } })
         } else if (typeof delta.reasoning === 'string' && delta.reasoning.length) {
           if (!textBlockStarted) {
             textBlockStarted = true
-            sendSSE(reply, 'content_block_start', {
-              type: 'content_block_start',
-              index: 0,
-              content_block: { type: 'text', text: '' }
-            })
+            sendSSE(reply, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
           }
           accumulatedReasoning += delta.reasoning
-          sendSSE(reply, 'content_block_delta', {
-            type: 'content_block_delta',
-            index: 0,
-            delta: { type: 'thinking_delta', thinking: delta.reasoning }
-          })
+          sendSSE(reply, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: delta.reasoning } })
         }
       }
     }
